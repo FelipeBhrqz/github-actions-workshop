@@ -3,7 +3,15 @@ name: Mi primer CI
 # Triggers
 on:
   push:
+    branches:
+      - master
+      - dev
+    tags:
+      - "v*"
   pull_request:
+    branches:
+      - master
+      - dev
 
 # Jobs
 # Con una misma tuberia CI se pueden validar multiples confg. de entornos de ejecucion.
@@ -30,7 +38,7 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.10", "3.13"]
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -42,15 +50,100 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run tests
         run: pytest
-  
-  build:
-    runs-on: ubuntu-latest
 
+  docker-build:
+    runs-on: ubuntu-latest
     needs: test
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
       - name: Build docker image
-        run: docker build -t my-first-github-actions-wf .
-  
+        run: docker build -t github-actions-workshop:latest .
+
+  docker-push:
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.event_name == 'push'
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+      - name: Login in Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Extract Docker metadata
+        id: extract_metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/github-actions-workshop
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=ref,event=tag
+            type=sha
+      - name: Print generated tags
+        run: echo "${{ steps.extract_metadata.outputs.tags }}"
+      - name: Build & Push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.extract_metadata.outputs.tags }}
+          labels: ${{ steps.extract_metadata.outputs.labels }}
+
+  deploy-prod:
+    runs-on: ubuntu-latest
+    needs: docker-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    steps:
+      - name: Trigger render PROD deploy
+        run: |
+          curl -sS -X POST "https://api.render.com/v1/services/${{ secrets.RENDER_PROD_SERVICE_ID }}/deploys" \
+            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            --data '{"clearCache":"do_not_clear","deployMode":"build_and_deploy"}'
+
+  deploy-dev:
+    runs-on: ubuntu-latest
+    needs: docker-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    steps:
+      - name: Trigger render DEV deploy
+        run: |
+          curl -sS -X POST "https://api.render.com/v1/services/${{ secrets.RENDER_DEV_SERVICE_ID }}/deploys" \
+            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            --data '{"clearCache":"do_not_clear","deployMode":"build_and_deploy"}'
+
+  deployment-links:
+    runs-on: ubuntu-latest
+    needs: docker-push
+    if: always() && github.event_name == 'push'
+    steps:
+      - name: Publish prod and dev links
+        env:
+          PROD_URL: ${{ vars.RENDER_PROD_URL || secrets.RENDER_PROD_URL }}
+          DEV_URL: ${{ vars.RENDER_DEV_URL || secrets.RENDER_DEV_URL }}
+        run: |
+          echo "## Environments" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$PROD_URL" ]; then
+            echo "- [Prod]($PROD_URL)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Prod: define vars.RENDER_PROD_URL o secrets.RENDER_PROD_URL" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -n "$DEV_URL" ]; then
+            echo "- [Dev]($DEV_URL)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Dev: define vars.RENDER_DEV_URL o secrets.RENDER_DEV_URL" >> "$GITHUB_STEP_SUMMARY"
+          fi
